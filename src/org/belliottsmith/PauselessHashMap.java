@@ -16,8 +16,12 @@ package org.belliottsmith;/*
  * limitations under the License.
  */
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
+import java.lang.management.ThreadMXBean;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -25,6 +29,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import javax.management.MBeanServer;
 
 public class PauselessHashMap<K, V> implements Map<K, V>
 {
@@ -83,35 +88,25 @@ public class PauselessHashMap<K, V> implements Map<K, V>
     public V put(K key, V value)
     {
         assert key != null;
+        assert value != null;
         int hash = hash(key);
         int mask = table.length - 1;
         if (oldTable != null)
         {
-            for (int i = 0 ; i < 4 ; i++)
+            for (int i = 0 ; i < 8 ; i++)
                 migrate(migrated++, mask);
             if (migrated == oldTable.length)
                 oldTable = null;
             else if ((hash & (mask >> 1)) < migrated)
-                migrate(hash & (mask >> 1), mask);
-        }
-        int index = hash & mask;
-        Entry<K, V> entry = table[index], prec = null;
-        while (entry != null)
-        {
-            if (entry.hash == hash && entry.key.equals(key))
             {
-                V prev = entry.value;
-                entry.value = value;
-                return prev;
+                V result = put(key, value, hash, hash & (mask >> 1), oldTable);
+                if (result == null)
+                    ++size;
+                return result;
             }
-            prec = entry;
-            entry = entry.next;
         }
-        if (prec == null)
-            table[index] = new Entry<K, V>(key, value, hash);
-        else
-            prec.next = new Entry<K, V>(key, value, hash);
-        if (++size > nextResize && oldTable == null)
+        V result = put(key, value, hash, hash & (mask >> 1), table);
+        if (result == null && ++size > nextResize && oldTable == null)
         {
             if (table.length < 1024)
             {
@@ -150,6 +145,27 @@ public class PauselessHashMap<K, V> implements Map<K, V>
                 nextTable = null;
             }
         }
+        return result;
+    }
+
+    private static <K, V> V put(K key, V value, int hash, int index, Entry<K, V>[] table)
+    {
+        Entry<K, V> entry = table[index], prec = null;
+        while (entry != null)
+        {
+            if (entry.hash == hash && entry.key.equals(key))
+            {
+                V prev = entry.value;
+                entry.value = value;
+                return prev;
+            }
+            prec = entry;
+            entry = entry.next;
+        }
+        if (prec == null)
+            table[index] = new Entry<K, V>(key, value, hash);
+        else
+            prec.next = new Entry<K, V>(key, value, hash);
         return null;
     }
 
@@ -221,46 +237,73 @@ public class PauselessHashMap<K, V> implements Map<K, V>
     public static void main(String[] args)
     {
         for (int i = 0 ; i < 10 ; i++)
-            test2(1000000);
-        for (int i = 0 ; i < 10 ; i++)
-            test2(10000000);
-        for (int i = 0 ; i < 10 ; i++)
             test(1000000);
         for (int i = 0 ; i < 10 ; i++)
             test(10000000);
+        for (int i = 0 ; i < 10 ; i++)
+            test2(1000000);
+        for (int i = 0 ; i < 10 ; i++)
+            test2(10000000);
     }
 
-    final static long[] latencies = new long[1 << 25];
+    static ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+    final static long[] latencies = new long[1 << 27];
     private static void test2(int count)
     {
-        final PauselessHashMap<Integer, Integer> map = new PauselessHashMap<Integer, Integer>(16);
         System.gc();
+        startCpuMeasure();
+        long startTotal = System.nanoTime();
+        final PauselessHashMap<Integer, Integer> map = new PauselessHashMap<Integer, Integer>(16);
         for (int i = 0 ; i < count ; i++)
         {
             long start = System.nanoTime();
             map.put(i, i);
             latencies[i] = System.nanoTime() - start;
         }
+        long elapsedTotal = System.nanoTime() - startTotal;
+        System.gc();
+        long elapsedIncludingGc = System.nanoTime() - startTotal;
         long[] print = Arrays.copyOfRange(latencies, 0, count);
         Arrays.sort(print);
-        System.out.println("Mine:");
+        System.out.println(String.format("Mine: %.3f %.3fs %.3fs", cpuTime() / 1000000d, elapsedTotal / 1000000000d, elapsedIncludingGc / 1000000000d));
         System.out.println(String.format("%d %d %d %d %d", perc(0.5f, print), perc(0.95f, print), perc(0.99f, print), perc(0.999f, print), perc(0.99999f, print)));
         System.out.println(String.format("-- %d %d %d %d %d", print[print.length - 1], print[print.length - 2], print[print.length - 3], print[print.length - 4], print[print.length - 5]));
     }
 
+    static Map<Long, Long> starts = new HashMap<Long, Long>();
+    static void startCpuMeasure()
+    {
+        starts.clear();
+        for (long id : bean.getAllThreadIds())
+            starts.put(id, bean.getThreadCpuTime(id));
+    }
+
+    static long cpuTime()
+    {
+        long total = 0;
+        for (long id : starts.keySet())
+            total += bean.getThreadCpuTime(id) - starts.get(id);
+        return total;
+    }
+
     private static void test(int count)
     {
-        final org.giltene.PauselessHashMap map = new org.giltene.PauselessHashMap(16);
         System.gc();
+        startCpuMeasure();
+        long startTotal = System.nanoTime();
+        final org.giltene.PauselessHashMap map = new org.giltene.PauselessHashMap(16);
         for (int i = 0 ; i < count ; i++)
         {
             long start = System.nanoTime();
             map.put(i, i);
             latencies[i] = System.nanoTime() - start;
         }
+        long elapsedTotal = System.nanoTime() - startTotal;
         long[] print = Arrays.copyOfRange(latencies, 0, count);
+        System.gc();
+        long elapsedIncludingGc = System.nanoTime() - startTotal;
         Arrays.sort(print);
-        System.out.println("Gil's:");
+        System.out.println(String.format("Gil's: %.3f %.3fs %.3fs", cpuTime() / 1000000d, elapsedTotal / 1000000000d, elapsedIncludingGc / 1000000000d));
         System.out.println(String.format("%d %d %d %d %d", perc(0.5f, print), perc(0.95f, print), perc(0.99f, print), perc(0.999f, print), perc(0.99999f, print)));
         System.out.println(String.format("-- %d %d %d %d %d", print[print.length - 1], print[print.length - 2], print[print.length - 3], print[print.length - 4], print[print.length - 5]));
     }
